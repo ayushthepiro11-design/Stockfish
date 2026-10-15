@@ -3,7 +3,8 @@ name: Stockfish patch benchmark
 on:
   push:
     branches:
-      - run-stockfish-benchmark
+      - master
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -48,7 +49,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p benchmark-results
-          ./does-not-exist 2>/dev/null || true
           /tmp/sf_patch bench 2>&1 | tee benchmark-results/patch-bench.txt
           /tmp/sf_master bench 2>&1 | tee benchmark-results/master-bench.txt
           patch_nodes="$(grep 'Nodes searched' benchmark-results/patch-bench.txt | tail -1 | awk '{print $NF}')"

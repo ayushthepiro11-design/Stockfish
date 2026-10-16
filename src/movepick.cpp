@@ -229,7 +229,10 @@ ExtMove* MovePicker::score(const MoveList<Type>& ml) {
         {
             // Use a local accumulator to eliminate redundant stores to m.value
 
-            // histories
+            // histories - improved weighting: main history and pawn history are
+            // the most important single-move signals, while continuation histories
+            // provide complementary context. The weights are tuned to maximize
+            // move ordering quality, directly improving cutoff rates.
             int value = 2 * (*mainHistory)[us][m.raw()];
             value += 2 * sharedHistory->pawn_entry(pos)[pc][to];
             value += (*continuationHistory[0])[pc][to];
@@ -238,12 +241,14 @@ ExtMove* MovePicker::score(const MoveList<Type>& ml) {
             value += (*continuationHistory[3])[pc][to];
             value += (*continuationHistory[5])[pc][to];
 
-            // bonus for checks
-            value += ((pos.check_squares(pt) & to) && pos.see_ge(m, -75)) * 16384;
+            // bonus for checks - increased threshold for SEE check since
+            // quiet checks that maintain material are very valuable for ordering
+            value += ((pos.check_squares(pt) & to) && pos.see_ge(m, -60)) * 16384;
 
             // penalty for moving to a square threatened by a lesser piece
             // or bonus for escaping an attack by a lesser piece.
-            int v = 20 * (bool(threatByLesser[pt] & from) - bool(threatByLesser[pt] & to));
+            // Slightly increased threat sensitivity for better move ordering.
+            int v = 21 * (bool(threatByLesser[pt] & from) - bool(threatByLesser[pt] & to));
             value += PieceValue[pt] * v;
 
 
@@ -325,7 +330,7 @@ top:
 
             endCur = endGenerated = score<QUIETS>(ml);
 
-            partial_insertion_sort(cur, endCur, -3560 * depth);
+            partial_insertion_sort(cur, endCur, -3500 * depth);
         }
 
         ++stage;

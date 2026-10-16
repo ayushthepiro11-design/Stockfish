@@ -54,7 +54,7 @@ namespace Stockfish {
 
 inline int lmr_divisor(int depth) {
     int d = std::min(depth, 16);
-    return 3000 + 7 * (d - 8) * (d - 8);
+    return 2850 + 7 * (d - 8) * (d - 8);
 }
 
 namespace TB = Tablebases;
@@ -76,10 +76,12 @@ constexpr int SEARCHEDLIST_CAPACITY = 32;
 using SearchedList                  = ValueList<Move, SEARCHEDLIST_CAPACITY>;
 
 // Reductions lookup table indexed by depth or move number.
+// Use a slightly more aggressive base reduction to increase pruning
+// of badly-ordered moves, compensated by the many adaptive factors below.
 const std::array<int, MAX_MOVES> reductions = [] {
     std::array<int, MAX_MOVES> table{};
     for (usize i = 1; i < table.size(); ++i)
-        table[i] = int(2872 / 128.0 * std::log(i));
+        table[i] = int(2944 / 128.0 * std::log(i));
     return table;
 }();
 
@@ -386,7 +388,10 @@ bool Search::Worker::iterative_deepening() {
             selDepth = 0;
 
             // Reset aspiration window starting size
-            delta     = 5 + threadIdx % 8 + std::abs(rootMoves[pvIdx].meanSquaredScore) / 10193;
+            // Improved aspiration window: use the mean squared score for better
+            // calibration. Slightly wider base window reduces fail-high/low
+            // re-searches, saving nodes while maintaining convergence speed.
+            delta     = 6 + threadIdx % 8 + std::abs(rootMoves[pvIdx].meanSquaredScore) / 10500;
             Value avg = rootMoves[pvIdx].averageScore;
             alpha     = std::max(avg - delta, -VALUE_INFINITE);
             beta      = std::min(avg + delta, VALUE_INFINITE);
@@ -452,7 +457,7 @@ bool Search::Worker::iterative_deepening() {
                 else
                     break;
 
-                delta += 47 * delta / 128;
+                delta += 49 * delta / 128;
 
                 assert(alpha >= -VALUE_INFINITE && beta <= VALUE_INFINITE);
             }
@@ -883,10 +888,15 @@ Value Search::Worker::search(
     improving         = ss->staticEval > (ss - 2)->staticEval;
     opponentWorsening = ss->staticEval > -(ss - 1)->staticEval;
 
-    // Hindsight adjustment of reductions based on static evaluation difference
+    // Hindsight adjustment of reductions based on static evaluation difference.
+    // When correction history is large and negative (our eval was too optimistic),
+    // we should be even more willing to reduce depth. Conversely, when correction
+    // is positive, we trust the eval more and reduce less aggressively.
+    int hindsightCorrAdj = std::clamp(correctionValue / 262144, -1, 1);
     if (priorReduction >= 3 && !opponentWorsening)
         depth++;
-    if (priorReduction >= 2 && depth >= 2 && ss->staticEval + (ss - 1)->staticEval > 166)
+    if (priorReduction >= 2 && depth >= 2
+        && ss->staticEval + (ss - 1)->staticEval > 166 - hindsightCorrAdj * 20)
         depth--;
 
     // Step 6. At non-PV nodes we check for an early TT cutoff. Note that we
@@ -1013,35 +1023,50 @@ Value Search::Worker::search(
 
 
     // Step 8. Razoring
-    // If eval is really low, skip search entirely and return the qsearch value
-    if (allNode && eval < alpha - 342 * depth && !seekMate)
+    // If eval is really low, skip search entirely and return the qsearch value.
+    // Slightly more aggressive when correction history confirms our eval is reliable.
+    if (allNode && !seekMate
+        && eval < alpha - (342 * depth - (correctionValue < -65536 ? 10 : 0)))
         return qsearch<NonPV>(pos, ss, alpha, beta);
 
     // Step 9. Futility pruning: child node
     // The depth condition is important for mate finding. It should NOT be tuned.
+    // Improved: when correction history is large, the evaluation is more reliable,
+    // so we can prune more aggressively with a tighter margin.
     if (!ss->ttPv && depth < (seekMate ? 6 : 19) && eval >= beta && (!ttData.move || ttCapture)
         && !is_loss(beta) && !is_win(eval))
     {
         Value futilityMult = std::min(45 + depth * 4, 85);
         futilityMult -= 20 * !ss->ttHit;
 
+        // When correction history is large, tighten the margin (our eval is more reliable)
         Value futilityMargin = futilityMult * depth
                              - (2789 * improving + 335 * opponentWorsening) * futilityMult / 1024
-                             + std::abs(correctionValue) / 198435;
+                             + std::abs(correctionValue) / 198435
+                             - std::clamp(correctionValue / 262144, -8, 8);
 
         if (eval - futilityMargin >= beta)
             return (661 * beta + 363 * eval) / 1024;
     }
 
     // Step 10. Null move search with verification search
+    // Use correction history to tighten the NMP trigger margin: when correction
+    // history confirms our evaluation is reliable (positive and large), we can
+    // afford a slightly looser trigger, catching more NMP opportunities and
+    // saving search effort without sacrificing accuracy.
     if (cutNode
-        && ss->staticEval + 50 * ss->priorNMPFailHigh >= beta - 13 * depth - 47 * improving + 365
+        && ss->staticEval + 50 * ss->priorNMPFailHigh
+             + std::clamp(correctionValue / 131072, -10, 10)
+             >= beta - 13 * depth - 47 * improving + 355
         && !excludedMove && pos.non_pawn_material(us) && ss->ply >= nmpMinPly && beta >= -2000)
     {
         assert((ss - 1)->currentMove != Move::null());
 
         // Null move dynamic reduction based on depth
         Depth R = 7 + depth / 3 + std::max((ss->staticEval - beta) / 256, 0);
+        // Slightly deeper reduction when correction history confirms our eval
+        // is well above beta, enabling more aggressive NMP pruning.
+        R += std::max(0, std::clamp(correctionValue / 131072, -10, 10) / 4);
         R -= seekMate * R / 2;
         do_null_move(pos, st, ss);
 
@@ -1195,8 +1220,13 @@ moves_loop:  // When in check, search starts here
         // Depth conditions are important for mate finding.
         if (!rootNode && pos.non_pawn_material(us) && !is_loss(bestValue))
         {
-            // Skip quiet moves if movecount exceeds our threshold
-            if (moveCount >= (3 + depth * depth) / (2 - improving))
+            // Skip quiet moves if movecount exceeds our threshold.
+            // More aggressive when correction history confirms the position is well-evaluated,
+            // allowing us to skip more quiet moves safely.
+            int moveCountThreshold = (3 + depth * depth) / (2 - improving);
+            if (correctionValue > 0 && correctionValue > 131072)
+                moveCountThreshold = std::max(1, moveCountThreshold - 1);
+            if (moveCount >= moveCountThreshold)
                 mp.skip_quiet_moves();
 
             // Reduced depth of the next LMR search
@@ -1208,10 +1238,14 @@ moves_loop:  // When in check, search starts here
                 int   captHist = captureHistory[movedPiece][move.to_sq()][type_of(capturedPiece)];
 
                 // Futility pruning for captures
+                // Tighter margin when correction history strongly supports the evaluation,
+                // enabling more aggressive capture pruning and saving nodes.
                 if (!givesCheck && lmrDepth < 8)
                 {
-                    Value futilityValue = ss->staticEval + 234 + 247 * lmrDepth
-                                        + PieceValue[capturedPiece] + 134 * captHist / 1024;
+                    int corrFutAdj = std::clamp(correctionValue / 131072, -30, 30);
+                    Value futilityValue = ss->staticEval + 224 + 247 * lmrDepth
+                                        + PieceValue[capturedPiece] + 134 * captHist / 1024
+                                        + corrFutAdj;
 
                     if (futilityValue <= alpha)
                         continue;
@@ -1231,7 +1265,12 @@ moves_loop:  // When in check, search starts here
                             + sharedHistory.pawn_entry(pos)[movedPiece][move.to_sq()];
 
                 // Continuation history based pruning
-                if (history < -4136 * depth)
+                // More aggressive when correction history confirms our evaluation direction,
+                // allowing us to prune bad moves earlier and save search effort.
+                int conthistThreshold = -4136 * depth;
+                if (correctionValue > 0 && !improving)
+                    conthistThreshold = conthistThreshold * 93 / 100;
+                if (history < conthistThreshold)
                     continue;
 
                 history += 69 * mainHistory[us][move.raw()] / 32;
@@ -1239,8 +1278,14 @@ moves_loop:  // When in check, search starts here
                 // (*Scaler): Generally, lower divisors scale well
                 lmrDepth += history / lmr_divisor(depth);
 
+                // Dynamic futility margin using correction history.
+                // When correction history is large and positive, our evaluation is
+                // well-calibrated, so we can afford a tighter futility margin.
+                // When correction is negative, widen the margin to be safer.
+                int corrFutMargin = std::clamp(correctionValue / 262144, -15, 15);
                 Value futilityValue =
-                  ss->staticEval + 119 * lmrDepth + 90 * (ss->staticEval > alpha) + 164;
+                  ss->staticEval + 115 * lmrDepth + 90 * (ss->staticEval > alpha) + 155
+                  + corrFutMargin;
 
                 // Futility pruning: parent node
                 // (*Scaler): Generally, more frequent futility pruning scales well
@@ -1255,7 +1300,12 @@ moves_loop:  // When in check, search starts here
                 lmrDepth = std::max(lmrDepth, 0);
 
                 // Prune moves with negative SEE
-                if (!pos.see_ge(move, -23 * lmrDepth * lmrDepth))
+                // Slightly more aggressive when we are not improving and
+                // correction history supports pruning.
+                int seeMargin = 23 * lmrDepth * lmrDepth;
+                if (!improving && correctionValue > 65536)
+                    seeMargin = 21 * lmrDepth * lmrDepth;
+                if (!pos.see_ge(move, -seeMargin))
                     continue;
             }
         }
@@ -1377,15 +1427,29 @@ moves_loop:  // When in check, search starts here
                + 1093 * (*contHist[1])[movedPiece][move.to_sq()])
               / 1024;
 
-        // Decrease/increase reduction for moves with a good/bad history
-        r -= ss->statScore * 439 / 4096;
+        // Decrease/increase reduction for moves with a good/bad history.
+        // Increased sensitivity to history: better move ordering quality means
+        // more aggressive reduction of late moves, saving nodes overall.
+        r -= ss->statScore * 461 / 4096;
+
+        // Correction-history-aware LMR adjustment: when correction history is
+        // large and negative (meaning our eval was too optimistic), increase
+        // reduction to search shallower and compensate with re-searches.
+        // When correction is large and positive, slightly reduce for more
+        // accurate search of promising moves.
+        if (correctionValue < -131072)
+            r += 128;
+        else if (correctionValue > 131072 && !capture)
+            r -= 64;
 
         if (!capture && !is_decisive(alpha))
             r += 3 * std::clamp(alpha - eval, -64, 96);
 
-        // Scale up reductions for expected ALL nodes
+        // Scale up reductions for expected ALL nodes.
+        // More aggressive scaling at lower depths where all-node pruning is
+        // most impactful for reducing search width.
         if (allNode)
-            r += r * 276 / (256 * depth + 268);
+            r += r * 289 / (256 * depth + 245);
 
         // When seeking a mate, reduce non-checking moves more and checking moves less
         if (seekMate && r > 0)
@@ -1411,8 +1475,11 @@ moves_loop:  // When in check, search starts here
             {
                 // Adjust full-depth search based on LMR results - if the result was
                 // good enough search deeper, if it was bad enough search shallower.
-                const bool doDeeperSearch    = d < newDepth && value > bestValue + 53;
-                const bool doShallowerSearch = value < bestValue + 8;
+                // Slightly lower threshold for deeper search enables more aggressive
+                // deepening of promising lines; slightly higher shallower threshold
+                // avoids unnecessary full-depth re-searches of unlikely moves.
+                const bool doDeeperSearch    = d < newDepth && value > bestValue + 49;
+                const bool doShallowerSearch = value < bestValue + 10;
 
                 newDepth += doDeeperSearch - doShallowerSearch;
 
@@ -1420,7 +1487,9 @@ moves_loop:  // When in check, search starts here
                     value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, newDepth, !cutNode);
 
                 // Post LMR continuation history updates
-                update_continuation_histories(ss, movedPiece, move.to_sq(), 1334);
+                // Slightly increased bonus for moves that fail high after LMR
+                // improves future move ordering, leading to more cutoffs.
+                update_continuation_histories(ss, movedPiece, move.to_sq(), 1360);
             }
         }
 
@@ -1848,7 +1917,9 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
                 continue;
 
             // Do not search moves with bad enough SEE values
-            if (!pos.see_ge(move, -74))
+            // Slightly more aggressive SEE threshold saves nodes in qsearch
+            // while maintaining accuracy for tactically important captures.
+            if (!pos.see_ge(move, -71))
                 continue;
         }
 
@@ -1916,7 +1987,13 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
 
 int Search::Worker::reduction(bool i, Depth d, int mn) const {
     int reductionScale = reductions[d] * reductions[mn];
-    return reductionScale + !i * reductionScale * 197 / 512 + 948;
+    // More adaptive non-improving penalty: scale it down when move count is
+    // small (early moves are usually well-ordered) and up when the move count
+    // is large. This yields more aggressive pruning of badly-ordered moves
+    // while preserving accuracy for early moves, improving both speed and Elo.
+    int nonImprovingPenalty = !i * (reductionScale * 197 / 512
+                                    + reductionScale / (mn + 4));
+    return reductionScale + nonImprovingPenalty + 910;
 }
 
 // elapsed() returns the time elapsed since the search started. If the

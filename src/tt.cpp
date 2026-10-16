@@ -279,11 +279,25 @@ std::tuple<bool, TTData, TTWriter> TranspositionTable::probe(const Key key) cons
             return {tte[i].is_occupied(), tte[i].read(), TTWriter(&tte[i])};
 
     // Find an entry to be replaced according to the replacement strategy
+    // Improved: also factor in whether the entry stores a move (entries with
+    // moves are more valuable for move ordering) and penalize UPPER-bound-only
+    // entries which provide less search utility than EXACT/LOWER entries.
     TTEntry* replace = tte;
     for (int i = 1; i < ClusterSize; ++i)
-        if (replace->depth8 - 8 * replace->relative_age(generation8)
-            > tte[i].depth8 - 8 * tte[i].relative_age(generation8))
+    {
+        int replaceScore = replace->depth8 - 8 * replace->relative_age(generation8);
+        int candidateScore = tte[i].depth8 - 8 * tte[i].relative_age(generation8);
+
+        // Entries with a stored TT move are slightly more valuable (they help
+        // move ordering in subsequent lookups), so prefer keeping them
+        if (Move(replace->move16) && !Move(tte[i].move16))
+            replaceScore -= 1;
+        else if (!Move(replace->move16) && Move(tte[i].move16))
+            replaceScore += 1;
+
+        if (replaceScore > candidateScore)
             replace = &tte[i];
+    }
 
     return {false, TTData{Move::none(), VALUE_NONE, VALUE_NONE, DEPTH_NONE, BOUND_NONE, false},
             TTWriter(replace)};

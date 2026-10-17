@@ -1,0 +1,47 @@
+name: Temporary Stockfish x86-64 build and bench
+
+on:
+  push:
+    branches:
+      - "test/build-bench-c84bd29c-20261017"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout requested arena branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ayushthepiro11-design/Stockfish
+          ref: arena/c84bd29c-stockfish
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record tested commit
+        run: |
+          echo "Tested branch: arena/c84bd29c-stockfish"
+          echo "Tested commit: $(git rev-parse HEAD)"
+          git status --short --branch
+
+      - name: Build x86-64
+        working-directory: src
+        run: make -j"$(nproc)" build ARCH=x86-64
+
+      - name: Run bench
+        working-directory: src
+        shell: bash
+        run: |
+          set -o pipefail
+          ./stockfish bench 2>&1 | tee ../stockfish-bench.log
+
+      - name: Upload bench output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stockfish-bench-log
+          path: stockfish-bench.log
+          if-no-files-found: ignore

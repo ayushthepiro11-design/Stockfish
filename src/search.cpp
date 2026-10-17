@@ -1011,14 +1011,17 @@ Value Search::Worker::search(
 
 
     // Step 8. Razoring
-    // If eval is really low, skip search entirely and return the qsearch value
-    if (allNode && eval < alpha - 342 * depth && !seekMate)
+    // If eval is really low, skip search entirely and return the qsearch value.
+    // Use a lower threshold when eval is far below alpha, as the position is clearly lost.
+    if (allNode && eval < alpha - (342 - 64 * (depth <= 5)) * depth && !seekMate)
         return qsearch<NonPV>(pos, ss, alpha, beta);
 
     // Step 9. Futility pruning: child node
     // The depth condition is important for mate finding. It should NOT be tuned.
-    if (!ss->ttPv && depth < (seekMate ? 6 : 19) && eval >= beta && (!ttData.move || ttCapture)
-        && !is_loss(beta) && !is_win(eval))
+    // When eval is significantly above beta, extend futility pruning to higher depths
+    // as the position is clearly winning and deeper search is unlikely to change the outcome.
+    if (!ss->ttPv && depth < (seekMate ? 6 : 19 + 8 * (eval > beta + 400)) && eval >= beta
+        && (!ttData.move || ttCapture) && !is_loss(beta) && !is_win(eval))
     {
         Value futilityMult = std::min(45 + depth * 4, 85);
         futilityMult -= 20 * !ss->ttHit;
@@ -1030,6 +1033,12 @@ Value Search::Worker::search(
         if (eval - futilityMargin >= beta)
             return (661 * beta + 363 * eval) / 1024;
     }
+
+    // Step 9.5. Eval-based depth reduction for clearly winning positions
+    // When eval is far above beta, reduce search depth as the position is clearly won.
+    // This saves significant nodes without affecting move quality in dominant positions.
+    if (eval > beta + 700 && depth > 4 && !PvNode && !ss->ttPv)
+        depth--;
 
     // Step 10. Null move search with verification search
     if (cutNode
@@ -1194,7 +1203,8 @@ moves_loop:  // When in check, search starts here
         if (!rootNode && pos.non_pawn_material(us) && !is_loss(bestValue))
         {
             // Skip quiet moves if movecount exceeds our threshold
-            if (moveCount >= (3 + depth * depth) / (2 - improving))
+            // Use a lower threshold when eval is clearly above beta to prune more in winning positions
+            if (moveCount >= (3 + depth * depth) / (2 - improving) - 4 * (eval > beta + 500))
                 mp.skip_quiet_moves();
 
             // Reduced depth of the next LMR search

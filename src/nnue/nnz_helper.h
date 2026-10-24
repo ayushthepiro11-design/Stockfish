@@ -150,11 +150,11 @@ struct NNZInfo {
             }
             else
             {
-                usize bytes = sizeof(neurons1) / 32;
-                memcpy(out, &m1, bytes);
-                out += bytes;
-                memcpy(out, &m2, bytes);
-                out += bytes;
+                // For 256-bit vectors, combine the two 8-bit chunk masks into a
+                // single 16-bit store instead of writing two separate bytes.
+                const u16 combined = u16(u32(m1) | (u32(m2) << 8));
+                memcpy(out, &combined, sizeof(combined));
+                out += sizeof(combined);
             }
         #endif
         }

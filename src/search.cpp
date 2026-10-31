@@ -391,10 +391,8 @@ bool Search::Worker::iterative_deepening() {
             alpha     = std::max(avg - delta, -VALUE_INFINITE);
             beta      = std::min(avg + delta, VALUE_INFINITE);
 
-            // For multiPV we use previousScore because score is often -VALUE_INFINITE
-            Value seekMateScore = pvIdx ? rootMoves[pvIdx].previousScore : rootMoves[pvIdx].score;
-            seekMate =
-              seekMateScore != -VALUE_INFINITE && std::abs(seekMateScore) >= seekMateThreshold;
+            seekMate = rootMoves[pvIdx].previousScore != -VALUE_INFINITE
+                    && std::abs(rootMoves[pvIdx].previousScore) >= seekMateThreshold;
 
             // Adjust optimism based on root move's averageScore
             optimism[us]  = 456 * avg / (std::abs(avg) + 85);
@@ -683,7 +681,7 @@ void Search::Worker::do_move(Position&    pos,
 
     ++nodes;
 
-    Dirties& dirties = accumulatorStack.push();
+    Dirties& dirties = accumulatorStack.push(pos);
     pos.do_move(move, st, givesCheck, dirties, &sharedHistory);
 
     if (ss != nullptr)
@@ -1044,7 +1042,8 @@ Value Search::Worker::search(
         assert((ss - 1)->currentMove != Move::null());
 
         // Null move dynamic reduction based on depth
-        Depth R = 7 + depth / 3 + std::max((ss->staticEval - beta) / 256, 0);
+        // Odd threads reduce one ply less
+        Depth R = 7 + depth / 3 + std::max((ss->staticEval - beta) / 256, 0) - int(threadIdx & 1);
         R -= seekMate * R / 2;
         do_null_move(pos, st, ss);
 
@@ -1233,8 +1232,10 @@ moves_loop:  // When in check, search starts here
                             + (*contHist[1])[movedPiece][move.to_sq()]
                             + sharedHistory.pawn_entry(pos)[movedPiece][move.to_sq()];
 
-                // Continuation history based pruning
-                if (history < -4136 * depth)
+                // Continuation history based pruning. Not while seeking a mate: the
+                // history is unreliable there, and a quiet move may be the only way to
+                // complete, or to delay, the mate.
+                if (!seekMate && history < -4136 * depth)
                     continue;
 
                 history += 69 * mainHistory[us][move.raw()] / 32;
@@ -1247,7 +1248,7 @@ moves_loop:  // When in check, search starts here
 
                 // Futility pruning: parent node
                 // (*Scaler): Generally, more frequent futility pruning scales well
-                if (!ss->inCheck && lmrDepth < 12 && futilityValue <= alpha)
+                if (!ss->inCheck && !seekMate && lmrDepth < 12 && futilityValue <= alpha)
                 {
                     if (bestValue <= futilityValue && !is_decisive(bestValue)
                         && !is_win(futilityValue))
@@ -1257,8 +1258,9 @@ moves_loop:  // When in check, search starts here
 
                 lmrDepth = std::max(lmrDepth, 0);
 
-                // Prune moves with negative SEE
-                if (!pos.see_ge(move, -23 * lmrDepth * lmrDepth))
+                // Prune moves with negative SEE. A sacrifice is not a "bad" move when
+                // it is the fastest mate, or when it delays the mate the longest.
+                if (!seekMate && !pos.see_ge(move, -23 * lmrDepth * lmrDepth))
                     continue;
             }
         }
